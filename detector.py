@@ -95,12 +95,11 @@ def summarize_incidents(findings: pd.DataFrame, top_k:int=20) -> pd.DataFrame:
                     .reset_index())
     norm_if = _normalize(agg["max_if_score"].fillna(0.0))
     agg["risk"] = 2.0*agg["rule_hits"].astype(float) + 10.0*norm_if
-    conditions = [
-        agg["risk"] >= agg["risk"].quantile(0.8),
-        agg["risk"] >= agg["risk"].quantile(0.5)
-    ]
-    choices = ["High","Medium"]
-    agg["severity"] = np.select(conditions, choices, default="Low")
+    agg["severity"] = pd.cut(
+        agg["risk"],
+        bins=[-1, 5, 20, float("inf")], 
+        labels=["Low", "Medium", "High"]
+    )
     return agg.sort_values(["risk","last_seen"], ascending=[False, False]).head(top_k)
 
 def summarize_firewall_incidents(logs_fw: pd.DataFrame, top_k:int=20) -> pd.DataFrame:

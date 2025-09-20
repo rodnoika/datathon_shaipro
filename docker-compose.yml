@@ -1,0 +1,14 @@
+services:
+  cowrie:
+    image: cowrie/cowrie:latest
+    container_name: cowrie
+    restart: unless-stopped
+    ports:
+      - "2222:2222"    # SSH honeypot на локальном 2222
+      - "2223:2223"    # telnet на локальном 2223 (опционально)
+    volumes:
+      - ./log:/cowrie/log
+      - ./cowrie_logs:/cowrie/log   # <-- логи будут тут
+      - ./cowrie_etc:/cowrie/etc   # (опционально для конфигов)
+    environment:
+      - TZ=UTC

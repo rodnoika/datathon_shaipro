@@ -40,33 +40,76 @@ def _extract_int(q: str, default: int) -> int:
             pass
     return default
 
-def intent_to_query(query: str):
+def intent_to_query(query: str, log_type: str = "ssh"):
+    try:
+        gemini_result = intent_to_filter(query)
+        start = gemini_result["start"]
+        end = gemini_result["end"]
+        event = gemini_result.get("event")
+        status = gemini_result.get("status")
+    except Exception:
+        # fallback
+        start, end = parse_time_window(query)
+        event, status = None, None
+
     q = query.lower()
-    start, end = parse_time_window(q)
-    event = None
-    status = None
-
-    if ("вход" in q or "логин" in q or "авторизац" in q):
-        event = "auth"
-    if ("неудач" in q or "ошиб" in q or "fail" in q):
-        status = "fail"
-    elif "успеш" in q:
-        status = "success"
-
     op = "list"
-    limit = 10
-    if ("самый частый" in q or "топ" in q) and ("пользов" in q or "юзер" in q or "user" in q):
-        op = "top_users"; limit = _extract_int(q, 5)
-    elif ("самый частый" in q or "топ" in q) and ("ip" in q or "айпи" in q):
-        op = "top_ips"; limit = _extract_int(q, 5)
-    elif ("сколько" in q or "количеств" in q or "count" in q):
-        op = "count"
-    if op == "list" and ("атаки" in q or "подозрител" in q):
-        op = "top_ips"; limit = _extract_int(q, 5)
+    limit = _extract_int(q, 10)
 
+    # ---- общие операции ----
+    if "топ" in q or "top" in q or "самый частый" in q:
+        if "ip" in q or "айпи" in q:
+            op = "top_ips"
+        elif "юзер" in q or "пользов" in q or "username" in q:
+            op = "top_users"
+        elif "парол" in q:
+            op = "top_passwords"
+    elif "сколько" in q or "колич" in q or "count" in q:
+        op = "count"
+
+    # ---- SSH ----
+    if log_type == "ssh":
+        if any(w in q for w in ["вход", "логин", "auth"]):
+            event = event or "auth"
+        if any(w in q for w in ["неудач", "fail", "ошиб"]):
+            status = status or "fail"
+        elif "успеш" in q:
+            status = status or "success"
+
+        return {
+            "start": start, "end": end,
+            "event": event, "status": status,
+            "op": op, "limit": limit
+        }
+
+    # ---- Firewall ----
+    if log_type == "firewall":
+        action = "deny" if any(w in q for w in ["deny", "заблок", "блок"]) else None
+        return {
+            "start": start, "end": end,
+            "action": action,
+            "op": op, "limit": limit
+        }
+
+    # ---- Cowrie ----
+    if log_type == "cowrie":
+        eventid = None
+        if any(w in q for w in ["вход", "логин", "login"]):
+            eventid = "cowrie.login"
+        elif "команд" in q or "command" in q:
+            eventid = "cowrie.command"
+        elif "файл" in q or "upload" in q or "download" in q:
+            eventid = "cowrie.session.file"
+
+        return {
+            "start": start, "end": end,
+            "eventid": eventid,
+            "op": op, "limit": limit
+        }
+
+    # ---- default fallback ----
     return {
         "start": start, "end": end,
-        "event": event, "status": status,
         "op": op, "limit": limit
     }
 

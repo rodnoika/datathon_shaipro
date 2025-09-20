@@ -3,25 +3,32 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from detector import run_detection
-from chat import intent_to_filter
+from chat import intent_to_filter, intent_to_query
 from storage import load_blocklist, block_ip, filter_by_time
 from forecast import build_series, simple_linear_forecast
 import altair as alt
+from pathlib import Path
+import json
+import csv
+
 
 st.set_page_config(page_title="Shai.pro MVP", layout="wide")
 st.title("Shai.pro — DevSecOps AI Assistant (MVP)")
 st.sidebar.title("Log Source")
 log_source = st.sidebar.selectbox(
     "Выбери источник логов",
-    ["SSH Logs (sample_logs.csv)", "Firewall Logs (firewall_logs.csv)"]
+    ["SSH Logs (sample_logs.csv)", "Firewall Logs (firewall_logs.csv)", "Cowrie Honeypot Logs (cowrie_logs.csv)"]
 )
 
 if log_source.startswith("SSH"):
     DATA_PATH = "data/sample_logs.csv"
     log_type = "ssh"
-else:
+elif log_source.startswith("Firewall"):
     DATA_PATH = "data/firewall_logs.csv"
     log_type = "firewall"
+else:
+    DATA_PATH = "data/cowrie_logs.csv"
+    log_type = "cowrie"
 
 st.sidebar.write("CSV logs path:", DATA_PATH)
 window_minutes = st.sidebar.slider("Rolling window (minutes)", 1, 15, 5)
@@ -33,9 +40,53 @@ st.sidebar.write("**Blocklist**")
 blocked = load_blocklist()
 st.sidebar.code("\\n".join(sorted(blocked)) or "(empty)")
 
-logs, findings, incidents = run_detection(
-    DATA_PATH, window_minutes, fail_threshold, contamination, log_type=log_type
-)
+def sync_cowrie_to_csv():
+    cowrie_json = Path("cowrie_logs/log/cowrie/cowrie.json")
+    out_csv = Path("data/cowrie_logs.csv")
+    fields = ["timestamp", "src_ip", "dst_port", "eventid", "username", "password"]
+
+    if not cowrie_json.exists():
+        return
+
+    if not out_csv.exists():
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+
+    with cowrie_json.open("r", encoding="utf-8") as f, \
+         out_csv.open("w", newline="", encoding="utf-8") as fout:
+        writer = csv.DictWriter(fout, fieldnames=fields)
+        writer.writeheader()
+        for line in f:
+            try:
+                ev = json.loads(line)
+                writer.writerow({
+                    "timestamp": ev.get("timestamp"),
+                    "src_ip": ev.get("src_ip"),
+                    "dst_port": ev.get("dst_port"),
+                    "eventid": ev.get("eventid"),
+                    "username": ev.get("username"),
+                    "password": ev.get("password"),
+                })
+            except Exception:
+                continue
+
+sync_cowrie_to_csv()
+if log_type == "cowrie":
+    logs = pd.read_csv("data/cowrie_logs.csv")
+    logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
+    findings = pd.DataFrame()
+    incidents = (logs.groupby("src_ip")
+                      .size()
+                      .reset_index(name="events")
+                      .sort_values("events", ascending=False)
+                      .head(50))
+else:
+    logs, findings, incidents = run_detection(
+        DATA_PATH, window_minutes, fail_threshold, contamination, log_type=log_type
+    )
+
 
 incidents_view = incidents[~incidents["src_ip"].isin(blocked)].copy()
 
@@ -45,14 +96,58 @@ with tab1:
     if log_type == "ssh":
         col1, col2 = st.columns([2,1], gap="large")
         with col1:
-            st.subheader("Top suspicious IPs (with risk & severity)")
-            st.dataframe(incidents_view, use_container_width=True)
+            sev_order = {"High": 3, "Medium": 2, "Low": 1}
+            tbl = incidents_view.copy()
+            if "severity" not in tbl.columns: tbl["severity"] = "Low"
+            if "risk" not in tbl.columns: tbl["risk"] = 0.0
+
+            tbl["sev_rank"] = tbl["severity"].map(lambda x: sev_order.get(str(x), 0)).astype(int)
+            tbl["severity_badge"] = tbl["severity"].map({
+                "High": "🔴 High", "Medium": "🟠 Medium", "Low": "🟢 Low"
+            }).fillna("🟢 Low")
+
+            tbl_sorted = tbl.sort_values(["sev_rank", "risk"], ascending=[False, False])
+            if not tbl_sorted.empty:
+                top_row = tbl_sorted.iloc[0]
+                st.metric(
+                    "Highest risk IP",
+                    value=str(top_row["src_ip"]),
+                    help=f"Risk={top_row['risk']:.2f} | Severity={top_row['severity']} | Rule hits={int(top_row.get('rule_hits',0))}"
+                )
+
+            cols_show = ["src_ip", "risk", "severity_badge", "last_seen", "rule_hits", "max_if_score", "total_minutes"]
+            cols_show = [c for c in cols_show if c in tbl_sorted.columns]
+            st.dataframe(
+                tbl_sorted[cols_show].rename(columns={"severity_badge": "severity"}),
+                use_container_width=True
+            )
 
             st.markdown("**Anomaly timeline (fails/min & anomalies)**")
             if not findings.empty:
-                series_df = build_series(findings, window_minutes)
-                st.line_chart(series_df.set_index("minute")[["fails_per_min"]])
-                st.bar_chart(series_df.set_index("minute")[["anomalies"]])
+                series_df = build_series(findings, window_minutes).sort_values("minute")
+                line = (
+                    alt.Chart(series_df)
+                    .mark_line()
+                    .encode(
+                        x=alt.X("minute:T", axis=alt.Axis(title="Time (UTC)", format="%H:%M", labelAngle=-45, tickCount=10)),
+                        y=alt.Y("fails_per_min:Q", title="Fails / min"),
+                        tooltip=[alt.Tooltip("minute:T", format="%Y-%m-%d %H:%M"), "fails_per_min:Q"]
+                    )
+                    .properties(height=200, width="container")
+                )
+                st.altair_chart(line, use_container_width=True)
+
+                bars = (
+                    alt.Chart(series_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("minute:T", axis=alt.Axis(title="Time (UTC)", format="%H:%M", labelAngle=-45, tickCount=10)),
+                        y=alt.Y("anomalies:Q", title="Anomalies"),
+                        tooltip=[alt.Tooltip("minute:T", format="%Y-%m-%d %H:%M"), "anomalies:Q"]
+                    )
+                    .properties(height=160, width="container")
+                )
+                st.altair_chart(bars, use_container_width=True)
             else:
                 st.info("Нет minute-level данных для визуализации.")
 
@@ -60,7 +155,17 @@ with tab1:
             if not findings.empty:
                 fdf = simple_linear_forecast(build_series(findings, window_minutes), horizon_minutes=60)
                 if not fdf.empty:
-                    st.line_chart(fdf.set_index("minute"))
+                    forecast_chart = (
+                        alt.Chart(fdf.sort_values("minute"))
+                        .mark_line()
+                        .encode(
+                            x=alt.X("minute:T", axis=alt.Axis(title="Time (UTC)", format="%H:%M", labelAngle=-45, tickCount=10)),
+                            y=alt.Y("forecast:Q", title="Forecast (fails/min)"),
+                            tooltip=[alt.Tooltip("minute:T", format="%Y-%m-%d %H:%M"), "forecast:Q"]
+                        )
+                        .properties(height=160, width="container")
+                    )
+                    st.altair_chart(forecast_chart, use_container_width=True)
                 else:
                     st.caption("Недостаточно данных для прогноза.")
         with col2:
@@ -88,7 +193,7 @@ with tab1:
                     st.dataframe(corr[["src_ip","risk","severity","fw_denies","corr_boosted_severity"]], use_container_width=True)
                 except Exception as e:
                     st.caption(f"Correlation skipped: {e}")
-    else:
+    elif log_type == "firewall":
         st.subheader("Firewall Events Overview")
         st.dataframe(logs.head(50), use_container_width=True)
 
@@ -100,6 +205,33 @@ with tab1:
             st.bar_chart(top_blocked.set_index("src_ip"))
         else:
             st.info("Нет deny-событий в текущем файле.")
+    elif log_type == "cowrie":
+        st.subheader("Cowrie Honeypot Overview")
+        st.dataframe(logs.head(50), use_container_width=True)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown("**Top source IPs**")
+            top_ips = logs["src_ip"].value_counts().head(10).reset_index()
+            top_ips.columns = ["src_ip","events"]
+            st.dataframe(top_ips, use_container_width=True)
+        with col_b:
+            st.markdown("**Top usernames**")
+            if "username" in logs.columns:
+                top_users = logs["username"].dropna().astype(str).value_counts().head(10).reset_index()
+                top_users.columns = ["username","events"]
+                st.dataframe(top_users, use_container_width=True)
+            else:
+                st.caption("Нет колонки username")
+        with col_c:
+            st.markdown("**Top passwords**")
+            if "password" in logs.columns:
+                top_pw = logs["password"].dropna().astype(str).value_counts().head(10).reset_index()
+                top_pw.columns = ["password","events"]
+                st.dataframe(top_pw, use_container_width=True)
+            else:
+                st.caption("Нет колонки password")
+
 with tab2:
     st.subheader("Ask in natural language")
 
@@ -158,7 +290,7 @@ with tab2:
                         st.write(f"Найдено {len(sub)} событий (первые 200):")
                         st.dataframe(sub.head(200), use_container_width=True)
 
-    else:
+    elif log_type == "firewall":
         user_q_fw = st.text_input(
             "Firewall: например 'топ 10 IP по deny за день' / 'сколько deny за 5 минут' / 'покажи deny за час'"
         )
@@ -213,12 +345,64 @@ with tab2:
                     else:
                         st.write(f"Найдено {len(sub)} событий (первые 200):")
                         st.dataframe(sub.head(200), use_container_width=True)
+    elif log_type == "cowrie":
+        user_q_cw = st.text_input(
+            "Cowrie: например 'топ 10 IP за час' / 'самые частые пароли за день' / 'топ юзеров за 5 минут'"
+        )
+        if st.button("Ask", key="ask_cowrie"):
+            if not user_q_cw.strip():
+                st.warning("Введите запрос.")
+            else:
+                intent = intent_to_query(user_q_cw, log_type="cowrie")  # Gemini -> fallback
+                st.write("Parsed intent:", {
+                    "start": intent["start"].isoformat(),
+                    "end": intent["end"].isoformat(),
+                    "op": intent["op"],
+                    "limit": intent["limit"],
+                    "eventid": intent.get("eventid"),
+                    "username": intent.get("username"),
+                    "password": intent.get("password"),
+                })
+
+                logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
+                sub = logs[(logs["timestamp"] >= intent["start"]) & (logs["timestamp"] <= intent["end"])].copy()
+
+                if intent.get("eventid") and "eventid" in sub.columns:
+                    sub = sub[sub["eventid"].astype(str).str.contains(intent["eventid"], case=False, na=False)]
+                if intent.get("username") and "username" in sub.columns:
+                    sub = sub[sub["username"].astype(str).str.contains(intent["username"], case=False, na=False)]
+                if intent.get("password") and "password" in sub.columns:
+                    sub = sub[sub["password"].astype(str).str.contains(intent["password"], case=False, na=False)]
+
+                if sub.empty:
+                    st.info("Нет событий под запрос.")
+                else:
+                    op, limit = intent["op"], intent["limit"]
+                    if op == "top_ips":
+                        ans = sub["src_ip"].value_counts().head(limit).reset_index()
+                        ans.columns = ["src_ip","events"]
+                        st.dataframe(ans, use_container_width=True)
+                    elif op == "top_users" and "username" in sub.columns:
+                        ans = sub["username"].astype(str).value_counts().head(limit).reset_index()
+                        ans.columns = ["username","events"]
+                        st.dataframe(ans, use_container_width=True)
+                    elif op == "top_passwords" and "password" in sub.columns:
+                        ans = sub["password"].astype(str).value_counts().head(limit).reset_index()
+                        ans.columns = ["password","events"]
+                        st.dataframe(ans, use_container_width=True)
+                    elif op == "count":
+                        st.write(f"Количество событий: **{len(sub)}**")
+                    else:
+                        st.dataframe(sub.head(200), use_container_width=True)
 with tab3:
     if log_type == "ssh":
         st.subheader("Minute-level findings")
         st.dataframe(findings.head(500), use_container_width=True)
-    else:
+    elif log_type == "firewall":
         st.subheader("Firewall incidents (top denied sources)")
+        st.dataframe(incidents.head(50), use_container_width=True)
+    else:
+        st.subheader("Cowrie summary (top sources)")
         st.dataframe(incidents.head(50), use_container_width=True)
 
 
