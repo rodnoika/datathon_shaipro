@@ -1,0 +1,99 @@
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from datetime import datetime, timedelta
+
+def load_logs(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    if df["timestamp"].dt.tz is None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize("UTC")
+    return df
+
+def sliding_window_features(df: pd.DataFrame, window_minutes: int = 5) -> pd.DataFrame:
+    import pandas as pd
+
+    window_minutes = int(max(1, window_minutes))
+
+    dfa = df[df["event"] == "auth"].copy()
+    dfa["timestamp"] = pd.to_datetime(dfa["timestamp"], utc=True)
+
+    per_min = (
+        dfa.groupby(
+            ["src_ip", pd.Grouper(key="timestamp", freq="1min")]
+        )
+        .agg(
+            total=("status", "size"),
+            fails=("status", lambda s: (s == "fail").sum()),
+            successes=("status", lambda s: (s == "success").sum()),
+            users=("user", "nunique"),
+        )
+        .reset_index()
+        .sort_values(["src_ip", "timestamp"])
+        .reset_index(drop=True)
+    )
+
+    cols = ["total", "fails", "successes", "users"]
+    for col in cols:
+        per_min[f"r{window_minutes}m_{col}"] = (
+            per_min
+            .groupby("src_ip")[col]
+            .rolling(window=window_minutes, min_periods=1)
+            .sum()
+            .reset_index(level=0, drop=True)
+        )
+    per_min["fail_rate"] = (
+        per_min[f"r{window_minutes}m_fails"] /
+        per_min[f"r{window_minutes}m_total"].clip(lower=1)
+    )
+    per_min = per_min.fillna(0.0)
+    return per_min
+
+
+
+def rule_based_flags(features: pd.DataFrame,
+                     fail_threshold:int=10,
+                     window_minutes:int=5) -> pd.DataFrame:
+    cond_bruteforce = features[f"r{window_minutes}m_fails"] >= fail_threshold
+    flags = features.copy()
+    flags["rule_bruteforce"] = cond_bruteforce
+    flags["is_suspicious_rule"] = flags["rule_bruteforce"]
+    return flags
+
+def isolation_forest_scores(features: pd.DataFrame, contamination: float = 0.02) -> pd.DataFrame:
+    cols = [c for c in features.columns if c.startswith("r") or c in ["fail_rate"]]
+    X = features[cols].astype(float).fillna(0.0)
+    if len(X) < 10:
+        features["if_score"] = 0.0
+        features["is_suspicious_if"] = False
+        return features
+    model = IsolationForest(contamination=contamination, random_state=42)
+    model.fit(X)
+    scores = -model.score_samples(X) 
+    features = features.copy()
+    features["if_score"] = scores
+    thresh = pd.Series(scores).quantile(1 - contamination)
+    features["is_suspicious_if"] = features["if_score"] >= thresh
+    return features
+
+def merge_findings(flags: pd.DataFrame) -> pd.DataFrame:
+    out = flags.copy()
+    out["is_suspicious"] = out["is_suspicious_rule"] | out["is_suspicious_if"]
+    return out
+
+def summarize_incidents(findings: pd.DataFrame, top_k:int=20) -> pd.DataFrame:
+    agg = (findings.groupby("src_ip")
+                    .agg(last_seen=("timestamp","max"),
+                         max_if_score=("if_score","max"),
+                         rule_hits=("is_suspicious_rule","sum"),
+                         total_minutes=("timestamp","size"))
+                    .reset_index())
+    agg = agg.sort_values(["rule_hits","max_if_score"], ascending=[False,False]).head(top_k)
+    return agg
+
+def run_detection(csv_path: str, window_minutes:int=5, fail_threshold:int=10, contamination:float=0.02):
+    logs = load_logs(csv_path)
+    feats = sliding_window_features(logs, window_minutes=window_minutes)
+    flagged = rule_based_flags(feats, fail_threshold=fail_threshold, window_minutes=window_minutes)
+    with_if = isolation_forest_scores(flagged, contamination=contamination)
+    merged = merge_findings(with_if)
+    incidents = summarize_incidents(merged, top_k=50)
+    return logs, merged, incidents
