@@ -41,24 +41,62 @@ with tab1:
 
 with tab2:
     st.subheader("Ask in natural language")
-    user_q = st.text_input("Например: 'покажи все неудачные логины за час'")
+    user_q = st.text_input(
+        "Например: 'самый частый юзер который неудачно логинился за час' / 'топ 5 ip с неудачными входами за 5 минут' / 'сколько неудачных логинов за день'"
+    )
+
     if st.button("Ask"):
         if not user_q.strip():
             st.warning("Введите запрос.")
         else:
-            filt = intent_to_filter(user_q)
-            st.write("Parsed filter:", filt)
-            logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
-            sub = logs.copy()
-            if filt["start"] and filt["end"]:
-                sub = sub[(sub["timestamp"] >= filt["start"]) & (sub["timestamp"] <= filt["end"])]
-            if filt["event"]:
-                sub = sub[sub["event"] == filt["event"]]
-            if filt["status"]:
-                sub = sub[sub["status"] == filt["status"]]
-            st.write(f"Found {len(sub)} events")
-            st.dataframe(sub.head(200), use_container_width=True)
+            from chat import intent_to_query
 
+            intent = intent_to_query(user_q)
+            st.write("Parsed intent:", {
+                "start": intent["start"].isoformat(),
+                "end": intent["end"].isoformat(),
+                "event": intent["event"],
+                "status": intent["status"],
+                "op": intent["op"],
+                "limit": intent["limit"],
+            })
+
+            logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
+            sub = logs[(logs["timestamp"] >= intent["start"]) & (logs["timestamp"] <= intent["end"])].copy()
+            if intent["event"]:
+                sub = sub[sub["event"] == intent["event"]]
+            if intent["status"]:
+                sub = sub[sub["status"] == intent["status"]]
+
+            if sub.empty:
+                sub = logs[(logs["timestamp"] >= intent["end"] - pd.Timedelta(days=1)) & (logs["timestamp"] <= intent["end"])].copy()
+                if intent["event"]: sub = sub[sub["event"] == intent["event"]]
+                if intent["status"]: sub = sub[sub["status"] == intent["status"]]
+                st.caption("Ничего не нашли за выбранный период. Показаны данные за последние 24 часа.")
+
+            op = intent["op"]; limit = intent["limit"]
+
+            if sub.empty:
+                st.info("Нет событий под запрос.")
+            else:
+                if op == "top_users":
+                    ans = (sub.groupby("user").size().reset_index(name="events")
+                           .sort_values("events", ascending=False).head(limit))
+                    st.write(f"Топ {len(ans)} пользователей:")
+                    st.dataframe(ans, use_container_width=True)
+
+                elif op == "top_ips":
+                    ans = (sub.groupby("src_ip").size().reset_index(name="events")
+                           .sort_values("events", ascending=False).head(limit))
+                    st.write(f"Топ {len(ans)} IP-адресов:")
+                    st.dataframe(ans, use_container_width=True)
+
+                elif op == "count":
+                    st.write(f"Количество событий: **{len(sub)}**")
+
+                else:
+                    st.write(f"Найдено {len(sub)} событий (первые 200):")
+                    st.dataframe(sub.head(200), use_container_width=True)
 with tab3:
     st.subheader("Minute-level findings")
     st.dataframe(findings.head(500), use_container_width=True)

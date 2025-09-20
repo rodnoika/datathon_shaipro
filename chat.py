@@ -16,6 +16,60 @@ def _iso_utc(dt: datetime) -> str:
         dt = dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+def parse_time_window(text: str):
+    q = text.lower()
+    now = _now_utc()
+    if "последний час" in q or "за час" in q:
+        return now - timedelta(hours=1), now
+    if "за день" in q or "сегодня" in q:
+        return now - timedelta(days=1), now
+    if "последние 5 минут" in q or "за 5 минут" in q or "за пять минут" in q:
+        return now - timedelta(minutes=5), now
+    return now - timedelta(hours=1), now
+
+def _extract_int(q: str, default: int) -> int:
+    m = re.search(r"\b(\d{1,3})\b", q)
+    if m:
+        try:
+            n = int(m.group(1))
+            return max(1, min(1000, n))
+        except:
+            pass
+    return default
+
+def intent_to_query(query: str):
+    q = query.lower()
+    start, end = parse_time_window(q)
+    event = None
+    status = None
+
+    if ("вход" in q or "логин" in q or "авторизац" in q):
+        event = "auth"
+    if ("неудач" in q or "ошиб" in q or "fail" in q):
+        status = "fail"
+    elif "успеш" in q:
+        status = "success"
+
+    op = "list"
+    limit = 10
+    if ("самый частый" in q or "топ" in q) and ("пользов" in q or "юзер" in q or "user" in q):
+        op = "top_users"; limit = _extract_int(q, 5)
+    elif ("самый частый" in q or "топ" in q) and ("ip" in q or "айпи" in q):
+        op = "top_ips"; limit = _extract_int(q, 5)
+    elif ("сколько" in q or "количеств" in q or "count" in q):
+        op = "count"
+    if op == "list" and ("атаки" in q or "подозрител" in q):
+        op = "top_ips"; limit = _extract_int(q, 5)
+
+    return {
+        "start": start, "end": end,
+        "event": event, "status": status,
+        "op": op, "limit": limit
+    }
+
 def _coerce_datetime(s: str) -> datetime:
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     if dt.tzinfo is None:
