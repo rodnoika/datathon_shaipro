@@ -1,6 +1,4 @@
-import os
-import re
-import json
+import os, re, json
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -9,6 +7,33 @@ import google.generativeai as genai
 
 _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 
+
+def _first_scalar(x):
+    if isinstance(x, list):
+        return _first_scalar(x[0]) if x else None
+    if isinstance(x, dict):
+        for k in ("value", "text", "name"):
+            if k in x:
+                return _first_scalar(x[k])
+        if x:
+            return _first_scalar(next(iter(x.values())))
+        return None
+    return x
+
+def _to_str_or_none(x):
+    x = _first_scalar(x)
+    return str(x) if x is not None else None
+
+def _to_int_or(default, lo=1, hi=1000):
+    def conv(x):
+        x = _first_scalar(x)
+        try:
+            n = int(x)
+            return max(lo, min(hi, n))
+        except Exception:
+            return default
+    return conv
+
 def _iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -16,12 +41,26 @@ def _iso_utc(dt: datetime) -> str:
         dt = dt.astimezone(timezone.utc)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-def _now_utc():
-    return datetime.now(timezone.utc)
+def _coerce_datetime(s: str) -> datetime:
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
+def debug_intent(query: str="заблокируй IP 123.45.67.89 за сегодня", log_type: str="ssh"):
+    try:
+        parsed = intent_to_filter(query, log_type)
+        print("\n[DEBUG Gemini] RAW:", query)
+        print("[DEBUG Gemini] RESULT:", parsed)
+        return parsed
+    except Exception as e:
+        print(f"[DEBUG Gemini] FAILED ({e}), fallback...")
+        parsed = intent_to_query(query, log_type)
+        print("[DEBUG Fallback] RESULT:", parsed)
+        return parsed
 def parse_time_window(text: str):
     q = text.lower()
-    now = _now_utc()
+    now = datetime.now(timezone.utc)
     if "последний час" in q or "за час" in q:
         return now - timedelta(hours=1), now
     if "за день" in q or "сегодня" in q:
@@ -36,150 +75,167 @@ def _extract_int(q: str, default: int) -> int:
         try:
             n = int(m.group(1))
             return max(1, min(1000, n))
-        except:
+        except Exception:
             pass
     return default
 
-def intent_to_query(query: str, log_type: str = "ssh"):
-    try:
-        gemini_result = intent_to_filter(query)
-        start = gemini_result["start"]
-        end = gemini_result["end"]
-        event = gemini_result.get("event")
-        status = gemini_result.get("status")
-    except Exception:
-        # fallback
-        start, end = parse_time_window(query)
-        event, status = None, None
 
-    q = query.lower()
-    op = "list"
-    limit = _extract_int(q, 10)
-
-    # ---- общие операции ----
-    if "топ" in q or "top" in q or "самый частый" in q:
-        if "ip" in q or "айпи" in q:
-            op = "top_ips"
-        elif "юзер" in q or "пользов" in q or "username" in q:
-            op = "top_users"
-        elif "парол" in q:
-            op = "top_passwords"
-    elif "сколько" in q or "колич" in q or "count" in q:
-        op = "count"
-
-    # ---- SSH ----
-    if log_type == "ssh":
-        if any(w in q for w in ["вход", "логин", "auth"]):
-            event = event or "auth"
-        if any(w in q for w in ["неудач", "fail", "ошиб"]):
-            status = status or "fail"
-        elif "успеш" in q:
-            status = status or "success"
-
-        return {
-            "start": start, "end": end,
-            "event": event, "status": status,
-            "op": op, "limit": limit
-        }
-
-    # ---- Firewall ----
-    if log_type == "firewall":
-        action = "deny" if any(w in q for w in ["deny", "заблок", "блок"]) else None
-        return {
-            "start": start, "end": end,
-            "action": action,
-            "op": op, "limit": limit
-        }
-
-    # ---- Cowrie ----
-    if log_type == "cowrie":
-        eventid = None
-        if any(w in q for w in ["вход", "логин", "login"]):
-            eventid = "cowrie.login"
-        elif "команд" in q or "command" in q:
-            eventid = "cowrie.command"
-        elif "файл" in q or "upload" in q or "download" in q:
-            eventid = "cowrie.session.file"
-
-        return {
-            "start": start, "end": end,
-            "eventid": eventid,
-            "op": op, "limit": limit
-        }
-
-    # ---- default fallback ----
-    return {
-        "start": start, "end": end,
-        "op": op, "limit": limit
-    }
-
-def _coerce_datetime(s: str) -> datetime:
-    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-def intent_to_filter(query: str):
+def intent_to_filter(query: str, log_type: str = "ssh"):
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is not set")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_GEMINI_MODEL)
+
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "start":   {"type": "string", "format": "date-time", "nullable": True},
+            "end":     {"type": "string", "format": "date-time", "nullable": True},
+
+            "event":   {"type": "string", "enum": ["auth","firewall","cowrie"], "nullable": True},
+            "status":  {"type": "string", "enum": ["fail","success"], "nullable": True},
+            "action":  {"type": "string", "enum": ["deny","allow"], "nullable": True},
+
+            "eventid": {"type": "string", "nullable": True},
+            "username":{"type": "string", "nullable": True},
+            "password":{"type": "string", "nullable": True},
+
+            "op":      {"type": "string", "enum": [
+                "top_ips","top_users","top_passwords","count",
+                "timeline","report","block_ip","unblock_ip",
+                "incident","list"
+            ]},
+
+            "limit":   {"type": "integer"},
+            "context": {"type": "string", "enum": ["executive","analyst","technical"]},
+            "target":  {"type": "string", "nullable": True},
+        },
+        "required": ["op"],
+        "additionalProperties": False
+    }
+
+    generation_config = {
+        "temperature": 0.2,
+        "response_mime_type": "application/json",
+        #"response_schema": response_schema,
+    }
+
+    system_instruction = f"""
+Ты SecOps-ассистент. Верни СТРОГИЙ JSON по схеме. Никаких комментариев.
+Текущее UTC: "{_iso_utc(datetime.now(timezone.utc))}"
+Правила времени:
+- "за час" -> [now-1h, now]
+- "за день" -> [now-24h, now]
+- "за 5 минут" -> [now-5m, now]
+Логические правила:
+- Если запрос про блокировку и указан IP -> op="block_ip"
+- Если про разблокировку -> op="unblock_ip"
+- Отчёт/summary -> op="report"
+- Инцидент -> op="incident"
+- Топ N -> op="top_ips"/"top_users"/"top_passwords"
+- Сколько -> op="count"
+- Иначе -> op="list"
+"""
 
     now = datetime.now(timezone.utc)
 
-    system_rules = f"""
-Ты помощник SecOps. Преобразуй русский запрос о логах в СТРОГИЙ JSON-фильтр.
-ТЕКУЩЕЕ UTC ВРЕМЯ: "{_iso_utc(now)}"
+    few_shots = [
+        f'Запрос: "заблокируй IP 123.45.67.89 за сегодня"',
+        '{ "op":"block_ip", "target":"123.45.67.89", "start":"%NOW-24H%", "end":"%NOW%", "context":"analyst" }',
+        f'Запрос: "разблокируй 123.45.67.89"',
+        '{ "op":"unblock_ip", "target":"123.45.67.89", "start":"%NOW-1H%", "end":"%NOW%", "context":"analyst" }',
+        f'Запрос: "топ 10 IP по deny за день"',
+        '{ "op":"top_ips", "limit":10, "action":"deny", "start":"%NOW-24H%", "end":"%NOW%", "context":"analyst" }'
+    ]
 
-Полям разрешены только значения:
-- "start": ISO 8601 UTC, например "2025-09-20T13:05:00Z"
-- "end":   ISO 8601 UTC
-- "event": "auth" или null
-- "status":"fail" или "success" или null
+    def sub_time(s):
+        return (s.replace("%NOW%", _iso_utc(now))
+                 .replace("%NOW-1H%", _iso_utc(now - timedelta(hours=1)))
+                 .replace("%NOW-24H%", _iso_utc(now - timedelta(days=1)))
+                 .replace("%NOW-5M%", _iso_utc(now - timedelta(minutes=5))))
 
-Правила интерпретации времени:
-- "за час", "последний час"  → [now-1h, now]
-- "за день", "сегодня"       → [now-24h, now]
-- "за 5 минут", "последние 5 минут" → [now-5m, now]
+    content = [sub_time(x) for x in few_shots] + [f'Запрос: """{query}"""']
 
-Если речь о логинах и НЕУДАЧАХ → event="auth", status="fail".
-Если неясно — ставь null.
+    model = genai.GenerativeModel(
+        _GEMINI_MODEL,
+        system_instruction=system_instruction,
+        generation_config=generation_config,
+    )
 
-Ответь ТОЛЬКО JSON-объектом без пояснений.
-"""
+    resp = model.generate_content(content)
 
-    user_query = f'Запрос пользователя: """{query}"""'
-    prompt = f"{system_rules.strip()}\n\n{user_query.strip()}\n\nВерни только JSON с ключами: start, end, event, status."
+    text = (getattr(resp, "text", None) or "").strip()
+    if not text:
+        try:
+            text = json.dumps(resp.candidates[0].content.parts[0].text)  # может не сработать, просто попытка
+        except Exception:
+            raise RuntimeError("Empty response from Gemini")
 
-    resp = model.generate_content(prompt)
-    text = (resp.text or "").strip()
+    try:
+        def _coerce_obj(x):
+            if isinstance(x, list):
+                for it in x:
+                    if isinstance(it, dict):
+                        return it
+                return {}
+            if isinstance(x, dict):
+                return x
+            return {}
+        parsed = json.loads(text)
+        parsed = _coerce_obj(parsed)
 
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        raise ValueError(f"Gemini did not return JSON: {text[:200]}...")
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if not m:
+            raise
+        parsed = json.loads(m.group(0))
 
-    parsed = json.loads(m.group(0))
+    if "limit" not in parsed:
+        parsed["limit"] = _extract_int(query.lower(), 10)
+    if "context" not in parsed:
+        parsed["context"] = "analyst"
 
-    for key in ("start", "end", "event", "status"):
-        if key not in parsed:
-            raise ValueError(f"Missing key '{key}' in Gemini response")
+    if parsed.get("op") in ("block_ip","unblock_ip") and not parsed.get("target"):
+        m = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", query)
+        if m:
+            parsed["target"] = m.group(0)
 
-    start_dt = _coerce_datetime(parsed["start"])
-    end_dt   = _coerce_datetime(parsed["end"])
+    if isinstance(parsed.get("start"), str):
+        parsed["start"] = _coerce_datetime(parsed["start"])
+    else:
+        parsed["start"] = now - timedelta(hours=1)
+    if isinstance(parsed.get("end"), str):
+        parsed["end"] = _coerce_datetime(parsed["end"])
+    else:
+        parsed["end"] = now
 
-    event = parsed["event"]
-    status = parsed["status"]
+    print("[Gemini]", text, parsed)
+    return parsed
 
-    if event not in (None, "auth"):
-        raise ValueError(f"Invalid 'event': {event}")
-    if status not in (None, "fail", "success"):
-        raise ValueError(f"Invalid 'status': {status}")
 
-    return {
-        "start": start_dt,
-        "end": end_dt,
-        "event": event,
-        "status": status
-    }
+def intent_to_query(query: str, log_type: str = "ssh"):
+    try:
+        return intent_to_filter(query, log_type=log_type)
+    except Exception as e:
+        print(f"[intent_to_query] Gemini failed, fallback: {e}")
+        start, end = parse_time_window(query)
+        q = query.lower()
+        op = "list"
+        limit = _extract_int(q, 10)
+        if "топ" in q or "top" in q or "самый частый" in q:
+            if "ip" in q: op = "top_ips"
+            elif "юзер" in q or "username" in q: op = "top_users"
+            elif "парол" in q: op = "top_passwords"
+        elif "сколько" in q or "колич" in q or "count" in q:
+            op = "count"
+
+        base = {"start": start, "end": end, "op": op, "limit": limit, "context":"analyst"}
+        if log_type == "ssh":
+            if any(w in q for w in ["вход","логин","auth"]): base["event"] = "auth"
+            if any(w in q for w in ["неудач","fail","ошиб"]): base["status"] = "fail"
+        elif log_type == "firewall":
+            if any(w in q for w in ["deny","заблок","блок"]): base["action"] = "deny"
+        elif log_type == "cowrie":
+            pass
+        return base

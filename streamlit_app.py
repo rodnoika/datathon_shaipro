@@ -4,7 +4,7 @@ import streamlit as st
 from datetime import datetime, timezone
 from detector import run_detection
 from chat import intent_to_filter, intent_to_query
-from storage import load_blocklist, block_ip, filter_by_time
+from storage import load_blocklist, block_ip, filter_by_time, unblock_ip
 from forecast import build_series, simple_linear_forecast
 import altair as alt
 from pathlib import Path
@@ -37,9 +37,16 @@ contamination = st.sidebar.slider("IF contamination", 0.01, 0.2, 0.02, step=0.01
 
 st.sidebar.markdown("---")
 st.sidebar.write("**Blocklist**")
-blocked = load_blocklist()
-st.sidebar.code("\\n".join(sorted(blocked)) or "(empty)")
-
+blocked = sorted(load_blocklist())
+if blocked:
+    st.sidebar.code("\n".join(blocked))
+    ip_to_unblock = st.sidebar.selectbox("Unblock IP", [""] + blocked)
+    if st.sidebar.button("✅ Unblock IP"):
+        if ip_to_unblock:
+            unblock_ip(ip_to_unblock)
+            st.sidebar.success(f"IP {ip_to_unblock} removed from blocklist. Refresh to update.")
+else:
+    st.sidebar.code("(empty)")
 def sync_cowrie_to_csv():
     cowrie_json = Path("cowrie_logs/log/cowrie/cowrie.json")
     out_csv = Path("data/cowrie_logs.csv")
@@ -89,7 +96,10 @@ else:
 
 
 incidents_view = incidents[~incidents["src_ip"].isin(blocked)].copy()
-
+if "severity" in incidents_view.columns:
+    high_risk_ips = incidents_view[incidents_view["severity"] == "High"]["src_ip"].unique()
+    for ip in high_risk_ips:
+        block_ip(ip)
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "💬 Chat", "⚙️ Incidents"])
 
 with tab1:
@@ -244,14 +254,16 @@ with tab2:
                 st.warning("Введите запрос.")
             else:
                 from chat import intent_to_query  
-                intent = intent_to_query(user_q)
+                intent = intent_to_query(user_q, log_type="ssh")  # Gemini-first
                 st.write("Parsed intent:", {
                     "start": intent["start"].isoformat(),
                     "end": intent["end"].isoformat(),
-                    "event": intent["event"],
-                    "status": intent["status"],
+                    "event": intent.get("event"),
+                    "status": intent.get("status"),
                     "op": intent["op"],
                     "limit": intent["limit"],
+                    "target": intent.get("target"),
+                    "context": intent.get("context"),
                 })
 
                 logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
@@ -269,7 +281,16 @@ with tab2:
                     if intent.get("status") and "status" in sub.columns:
                         sub = sub[sub["status"] == intent["status"]]
                     st.caption("Ничего не нашли за выбранный период. Показаны данные за последние 24 часа.")
+                
+                if intent["op"] == "block_ip" and intent.get("target"):
+                    block_ip(str(intent["target"]))
+                    st.success(f"IP {intent['target']} добавлен в блоклист.")
+                    st.stop()
 
+                if intent["op"] == "unblock_ip" and intent.get("target"):
+                    unblock_ip(str(intent["target"]))
+                    st.success(f"IP {intent['target']} удалён из блоклиста.")
+                    st.stop()
                 op = intent["op"]; limit = intent["limit"]
                 if sub.empty:
                     st.info("Нет событий под запрос.")
@@ -298,53 +319,47 @@ with tab2:
             if not user_q_fw.strip():
                 st.warning("Введите запрос.")
             else:
-                q = user_q_fw.lower()
-                from datetime import timedelta
-                now = datetime.now(timezone.utc)
-                if "за 5 минут" in q or "за пять минут" in q:
-                    start, end = now - timedelta(minutes=5), now
-                elif "за день" in q or "сегодня" in q:
-                    start, end = now - timedelta(days=1), now
-                elif "за час" in q or "последний час" in q:
-                    start, end = now - timedelta(hours=1), now
+                intent = intent_to_query(user_q_fw, log_type="firewall")
+            st.write("Parsed intent:", {
+                "start": intent["start"].isoformat(),
+                "end": intent["end"].isoformat(),
+                "op": intent["op"],
+                "limit": intent["limit"],
+                "action": intent.get("action"),
+                "target": intent.get("target"),
+            })
+
+            if intent["op"] == "block_ip" and intent.get("target"):
+                block_ip(str(intent["target"]))
+                st.success(f"IP {intent['target']} добавлен в блоклист.")
+                st.stop()
+            if intent["op"] == "unblock_ip" and intent.get("target"):
+                from storage import unblock_ip
+                unblock_ip(str(intent["target"]))
+                st.success(f"IP {intent['target']} удалён из блоклиста.")
+                st.stop()
+
+            logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
+            sub = logs[(logs["timestamp"] >= intent["start"]) & (logs["timestamp"] <= intent["end"])].copy()
+
+            action = intent.get("action")
+            if action and "action" in sub.columns:
+                sub = sub[sub["action"].astype(str).str.lower() == action.lower()]
+
+            if sub.empty:
+                st.info("Нет событий под запрос.")
+            else:
+                op, limit = intent["op"], intent["limit"]
+                if op == "top_ips":
+                    ans = (sub.groupby("src_ip").size().reset_index(name="events")
+                           .sort_values("events", ascending=False).head(limit))
+                    st.write(f"Топ {len(ans)} IP (фильтр action: {action or '—'}):")
+                    st.dataframe(ans, use_container_width=True)
+                elif op == "count":
+                    st.write(f"Количество событий: **{len(sub)}**")
                 else:
-                    start, end = now - timedelta(hours=1), now
-
-                limit = 10
-                import re
-                m = re.search(r"\b(\d{1,3})\b", q)
-                if m:
-                    try:
-                        limit = max(1, min(1000, int(m.group(1))))
-                    except:
-                        pass
-                if "топ" in q or "самый частый" in q:
-                    op = "top_ips"
-                elif "сколько" in q or "количеств" in q or "count" in q:
-                    op = "count"
-                else:
-                    op = "list"
-
-                logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)
-                sub = logs[(logs["timestamp"] >= start) & (logs["timestamp"] <= end)].copy()
-
-                if "deny" in q or "заблок" in q or "блок" in q:
-                    if "action" in sub.columns:
-                        sub = sub[sub["action"].astype(str).str.lower() == "deny"]
-
-                if sub.empty:
-                    st.info("Нет событий под запрос.")
-                else:
-                    if op == "top_ips":
-                        ans = (sub.groupby("src_ip").size().reset_index(name="events")
-                               .sort_values("events", ascending=False).head(limit))
-                        st.write(f"Топ {len(ans)} IP по событиям (в т.ч. deny, если указан):")
-                        st.dataframe(ans, use_container_width=True)
-                    elif op == "count":
-                        st.write(f"Количество событий: **{len(sub)}**")
-                    else:
-                        st.write(f"Найдено {len(sub)} событий (первые 200):")
-                        st.dataframe(sub.head(200), use_container_width=True)
+                    st.write(f"Найдено {len(sub)} событий (первые 200):")
+                    st.dataframe(sub.head(200), use_container_width=True)
     elif log_type == "cowrie":
         user_q_cw = st.text_input(
             "Cowrie: например 'топ 10 IP за час' / 'самые частые пароли за день' / 'топ юзеров за 5 минут'"
@@ -357,11 +372,12 @@ with tab2:
                 st.write("Parsed intent:", {
                     "start": intent["start"].isoformat(),
                     "end": intent["end"].isoformat(),
+                    "event": intent.get("event"),
+                    "status": intent.get("status"),
                     "op": intent["op"],
                     "limit": intent["limit"],
-                    "eventid": intent.get("eventid"),
-                    "username": intent.get("username"),
-                    "password": intent.get("password"),
+                    "target": intent.get("target"),
+                    "context": intent.get("context"),
                 })
 
                 logs["timestamp"] = pd.to_datetime(logs["timestamp"], utc=True)

@@ -18,11 +18,12 @@ def block_ip(ip: str):
     ips.add(ip)
     save_blocklist(list(ips))
 
+
 def unblock_ip(ip: str):
-    ips = load_blocklist()
-    if ip in ips:
-        ips.remove(ip)
-    save_blocklist(list(ips))
+    bl = load_blocklist()
+    bl = [x for x in bl if x != ip]
+    save_blocklist(bl)
+
 
 def filter_by_time(df: pd.DataFrame, start, end):
     mask = (df["timestamp"] >= start) & (df["timestamp"] <= end)

@@ -4,11 +4,11 @@ services:
     container_name: cowrie
     restart: unless-stopped
     ports:
-      - "2222:2222"    # SSH honeypot на локальном 2222
-      - "2223:2223"    # telnet на локальном 2223 (опционально)
+      - "2222:2222"  
+      - "2223:2223"  
     volumes:
       - ./log:/cowrie/log
-      - ./cowrie_logs:/cowrie/log   # <-- логи будут тут
-      - ./cowrie_etc:/cowrie/etc   # (опционально для конфигов)
+      - ./cowrie_logs:/cowrie/log 
+      - ./cowrie_etc:/cowrie/etc  
     environment:
       - TZ=UTC
