@@ -12,8 +12,8 @@ import json
 import csv
 
 
-st.set_page_config(page_title="Shai.pro MVP", layout="wide")
-st.title("Shai.pro — DevSecOps AI Assistant (MVP)")
+st.set_page_config(page_title="Shai.pro DataThon", layout="wide")
+st.title("Agai — DevSecOps AI Assistant")
 st.sidebar.title("Log Source")
 log_source = st.sidebar.selectbox(
     "Выбери источник логов",
